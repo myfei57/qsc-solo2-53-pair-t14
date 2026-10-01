@@ -45,3 +45,7 @@ class ConfigError(CokeError):
 
 class NamespaceError(CokeError):
     """命名空间重复注册或解析失败。"""
+
+
+class IdempotencyError(CokeError):
+    """提交标识非法或与既有提交冲突。"""

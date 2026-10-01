@@ -16,6 +16,9 @@ from .audit.record import AuditRecord
 from .charger.machine import ChargingCar
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
+from .control import ControlGate, LiveState
+from .control import readback as readback_mod
+from .control.registry import RequestRegistry
 from .door.latch import DoorLatch
 from .door.machine import DoorCleaner
 from .dust.damper import DustDamper
@@ -92,6 +95,9 @@ class Platform:
         self.damper = DustDamper(self.config.dust.damper_open_deg, self.config.dust.damper_rate_deg_per_s)
         self.schedule = DamperSchedule(self.config.dust.linkage_lag_s)
 
+        self.requests = RequestRegistry(store)
+        self.gate = self._build_gate()
+
         self._cycles = 0
         self._operations = 0
         self._lock = threading.RLock()
@@ -139,7 +145,72 @@ class Platform:
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
 
-    def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
+    def _build_gate(self) -> ControlGate:
+        """装配提交闸口：幂等登记表 + 锁内现读 + 控制周期推进。"""
+
+        def read_live(action: str, params: dict) -> LiveState:
+            return readback_mod.read_live(
+                action,
+                charger=self.charger,
+                guide=self.guide,
+                collector=self.collector,
+                reversal=self.reversal,
+                dust=self.dust,
+                door=self.door,
+                faults=self.gate.fault_components,
+            )
+
+        return ControlGate(
+            self.requests,
+            clock=self.clock,
+            live_reader=read_live,
+            cycle_pump=self._queue_pump,
+            settled_checks={"charge": self.collector.settled},
+            bus=self.bus,
+            op_ids=self.ids,
+        )
+
+    def _queue_pump(self, dt: float) -> None:
+        """排队等待时推进一个控制周期（闸口在持锁状态下调用）。"""
+
+        self.collector.regulate(dt)
+        moment = self.clock.now()
+        target_deg = self.damper.open_deg if self.schedule.links() else 0.0
+        angle = self.damper.drive_to(target_deg, dt)
+        if self.damper.at_open():
+            self.schedule.clear()
+        self.trend.append("collector_pressure", moment, self.collector.pressure_pa)
+        self.trend.append("damper_angle", moment, angle)
+
+    # -- 提交控制（控制台/命令行统一入口） ----------------------------------
+
+    def admission_preview(self, action: str, params: dict) -> dict:
+        """只判定不执行，返回动作在当前状态下的准入结论。"""
+
+        return self.gate.preview(action, params, self.config)
+
+    def admission_policy(self) -> dict:
+        """返回动作处置策略与登记/排队计数。"""
+
+        return self.gate.policy()
+
+    def request_status(self, request_id: str) -> dict | None:
+        """查询某次提交标识的状态与终态结果。"""
+
+        return self.gate.request_view(request_id)
+
+    def requests_list(self, limit: int = 50) -> dict:
+        return {"requests": self.gate.requests_recent(limit=limit)}
+
+    def inject_readback_fault(self, components: list[str]) -> dict:
+        """注入状态回读故障（组件读取即失败，按不允许处理）。"""
+
+        return {"readback_faults": self.gate.inject_fault(components)}
+
+    def clear_readback_faults(self) -> dict:
+        return {"readback_faults": self.gate.clear_faults()}
+
+    def _record_operation(self, op_id: str, operation: str, report: dict, request_id: str = "") -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
 
         oven = str(report.get("oven", ""))
@@ -157,11 +228,16 @@ class Platform:
                     step["action"],
                     oven=oven,
                     op_id=op_id,
+                    request_id=request_id,
                     severity="notice",
                     **detail,
                 )
             )
         for violation in report.get("violations", []):
+            # 拒绝原因统一回 reasons 表取文案，保证判定、展示、审计三处一致。
+            from .control.reasons import describe
+
+            reason = describe(violation)
             self.bus.publish(
                 Event.of(
                     "audit",
@@ -169,13 +245,17 @@ class Platform:
                     "interlock_rejected",
                     oven=oven,
                     op_id=op_id,
+                    request_id=request_id,
                     severity="alarm",
-                    message=f"{operation} 被拒绝：{violation}",
+                    message=f"{operation} 被拒绝：{reason['message']}",
                     violation=violation,
+                    reason=reason,
+                    component=reason["component"],
                 )
             )
         summary = {
             "op_id": op_id,
+            "request_id": request_id,
             "operation": operation,
             "oven": oven,
             "ok": bool(report.get("ok")),
@@ -218,19 +298,30 @@ class Platform:
         hopper_target_mm: float = 0.0,
         hopper_measured_mm: float = 0.0,
         dt: float = 1.0,
+        *,
+        request_id: str | None = None,
     ) -> dict:
-        """装煤编排：煤斗对位 → 调压 → 开翻板 → 给煤。"""
+        """装煤编排：煤斗对位 → 调压 → 开翻板 → 给煤。
 
-        with self._lock:
-            op_id = self.ids.next()
+        经提交闸口：同一 ``request_id`` 只执行一次；集气管压力未稳时按策略
+        排队等状态满足，煤斗未对位等其余条件不满足当场拒绝。
+        """
+
+        params = {
+            "oven": oven,
+            "hopper_target_mm": hopper_target_mm,
+            "hopper_measured_mm": hopper_measured_mm,
+            "dt": dt,
+        }
+
+        def execute(op_id: str, rid: str) -> dict:
             report = charge_oven(
                 self.charger, self.collector, self.flap, oven, hopper_target_mm, hopper_measured_mm, dt
             )
-            summary = self._record_operation(op_id, "charge", report)
-            summary["op_id"] = op_id
-            self._operations += 1
-            self._persist()
+            summary = self._record_operation(op_id, "charge", report, rid)
             return {**report, **summary}
+
+        return self._submit("charge", params, execute, request_id=request_id, oven=oven)
 
     def push(
         self,
@@ -240,13 +331,27 @@ class Platform:
         stroke_target_mm: float | None = None,
         speed_mm_s: float | None = None,
         dt: float = 1.0,
+        *,
+        request_id: str | None = None,
     ) -> dict:
-        """推焦编排：导焦栅对位 → 锁定 → 推焦 → 退杆；同时触发除尘联动。"""
+        """推焦编排：导焦栅对位 → 锁定 → 推焦 → 退杆；同时触发除尘联动。
 
-        with self._lock:
-            op_id = self.ids.next()
-            target = self.stroke.baseline_mm if stroke_target_mm is None else stroke_target_mm
-            self.speed.request("auto_cycle", speed_mm_s or self.config.pusher.speed_default_mm_s, priority=50)
+        经提交闸口：导焦栅未对位、除尘风机未运行一律当场拒绝，不排队。
+        """
+
+        target = self.stroke.baseline_mm if stroke_target_mm is None else stroke_target_mm
+        speed = speed_mm_s or self.config.pusher.speed_default_mm_s
+        params = {
+            "oven": oven,
+            "guide_target_mm": guide_target_mm,
+            "guide_measured_mm": guide_measured_mm,
+            "stroke_target_mm": target,
+            "speed_mm_s": speed,
+            "dt": dt,
+        }
+
+        def execute(op_id: str, rid: str) -> dict:
+            self.speed.request("auto_cycle", speed, priority=50)
             arbitration = self.speed.resolve()
             self.schedule.start_link(self.clock.now())
             report = push_oven(
@@ -262,50 +367,84 @@ class Platform:
             stroke_check = self.stroke.check(self.pusher.ram_mm)
             report["speed_arbitration"] = arbitration.as_dict()
             report["stroke_check"] = stroke_check
-            summary = self._record_operation(op_id, "push", report)
-            summary["op_id"] = op_id
-            self._operations += 1
-            self._persist()
+            summary = self._record_operation(op_id, "push", report, rid)
             return {**report, **summary}
 
-    def quench(self, oven: str = DEFAULT_OVEN, dt: float = 1.0) -> dict:
+        return self._submit("push", params, execute, request_id=request_id, oven=oven)
+
+    def quench(
+        self,
+        oven: str = DEFAULT_OVEN,
+        dt: float = 1.0,
+        *,
+        request_id: str | None = None,
+    ) -> dict:
         """熄焦编排：接焦 → 走行 → 喷淋。"""
 
-        with self._lock:
-            op_id = self.ids.next()
+        params = {"oven": oven, "dt": dt}
+
+        def execute(op_id: str, rid: str) -> dict:
             report = quench_oven(self.quench_car, oven, dt)
             report["travel_eta_s"] = self.quench_car.plan.eta_s()
-            summary = self._record_operation(op_id, "quench", report)
-            summary["op_id"] = op_id
-            self._operations += 1
-            self._persist()
+            summary = self._record_operation(op_id, "quench", report, rid)
             return {**report, **summary}
 
-    def reverse(self, oven: str = DEFAULT_OVEN, temperature_c: float | None = None) -> dict:
-        """换向编排：废气阀 → 煤气阀 → 炉温确认。"""
+        return self._submit("quench", params, execute, request_id=request_id, oven=oven)
 
-        with self._lock:
-            op_id = self.ids.next()
-            target_temp = self.config.heating.temp_target_c if temperature_c is None else temperature_c
+    def reverse(
+        self,
+        oven: str = DEFAULT_OVEN,
+        temperature_c: float | None = None,
+        *,
+        request_id: str | None = None,
+    ) -> dict:
+        """换向编排：废气阀 → 煤气阀 → 炉温确认。间隔未到当场拒绝，不排队。"""
+
+        target_temp = self.config.heating.temp_target_c if temperature_c is None else temperature_c
+        params = {"oven": oven, "temperature_c": target_temp}
+
+        def execute(op_id: str, rid: str) -> dict:
             report = reverse_heating(self.reversal, self.valves, self.temperature, oven, target_temp)
             report["offset_c"] = self.temperature.offset_c()
-            summary = self._record_operation(op_id, "reverse", report)
-            summary["op_id"] = op_id
-            self._operations += 1
-            self._persist()
+            summary = self._record_operation(op_id, "reverse", report, rid)
             return {**report, **summary}
 
-    def clean(self, oven: str = DEFAULT_OVEN, dt: float = 1.0) -> dict:
+        return self._submit("reverse", params, execute, request_id=request_id, oven=oven)
+
+    def clean(
+        self,
+        oven: str = DEFAULT_OVEN,
+        dt: float = 1.0,
+        *,
+        request_id: str | None = None,
+    ) -> dict:
         """炉门清扫编排：松开闩锁 → 开炉门 → 清扫 → 复位闩锁。"""
 
-        with self._lock:
-            op_id = self.ids.next()
+        params = {"oven": oven, "dt": dt}
+
+        def execute(op_id: str, rid: str) -> dict:
             report = clean_door(self.door, oven, dt)
-            summary = self._record_operation(op_id, "clean", report)
-            summary["op_id"] = op_id
+            summary = self._record_operation(op_id, "clean", report, rid)
+            return {**report, **summary}
+
+        return self._submit("clean", params, execute, request_id=request_id, oven=oven)
+
+    def _submit(self, action: str, params: dict, executor, *, request_id: str | None, oven: str) -> dict:
+        """所有动作提交的统一闸口：被受理执行（含中途失败）才计一次操作。"""
+
+        result = self.gate.submit(
+            action,
+            params,
+            executor,
+            request_id=request_id,
+            platform_lock=self._lock,
+            oven=oven,
+            config=self.config,
+        )
+        if not result.get("idempotent") and result.get("accepted"):
             self._operations += 1
             self._persist()
-            return {**report, **summary}
+        return result
 
     def cycle(self, dt: float = 1.0) -> dict:
         """推进一个控制周期，返回本周期摘要。"""
@@ -485,6 +624,7 @@ class Platform:
             "heating": self.heating_snapshot().as_dict(),
             "dust": self.dust_snapshot().as_dict(),
             "dust_starts": self.dust.starts(),
+            "control": self.admission_policy(),
             "audit": self.audit.summary(),
             "ids_issued": self.ids.issued(),
         }

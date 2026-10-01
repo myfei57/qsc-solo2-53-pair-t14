@@ -20,6 +20,15 @@ def _as_float(body: dict, key: str, default: float) -> float:
         raise CokeError(f"参数 {key!r} 必须是数值", component="console") from error
 
 
+def _request_id(body: dict) -> str | None:
+    """取提交标识；字段存在但为空按缺省（由平台代发）处理。"""
+
+    value = body.get("request_id")
+    if value is None:
+        return None
+    return str(value)
+
+
 class Api:
     """把 HTTP 请求翻译成平台调用。"""
 
@@ -46,6 +55,10 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/admission", self._admission)
+        add("GET", "/api/policy", lambda params, body: self._platform.admission_policy())
+        add("GET", "/api/requests", self._requests)
+        add("POST", "/api/readback-fault", self._readback_fault)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
         add("POST", "/api/push", self._push)
@@ -147,6 +160,7 @@ class Api:
             hopper_target_mm=_as_float(body, "hopper_target_mm", 0.0),
             hopper_measured_mm=_as_float(body, "hopper_measured_mm", 0.0),
             dt=_as_float(body, "dt", 1.0),
+            request_id=_request_id(body),
         )
 
     def _push(self, params: dict, body: dict) -> dict:
@@ -157,11 +171,14 @@ class Api:
             stroke_target_mm=_as_float(body, "stroke_target_mm", self._platform.stroke.baseline_mm),
             speed_mm_s=_as_float(body, "speed_mm_s", self._platform.config.pusher.speed_default_mm_s),
             dt=_as_float(body, "dt", 1.0),
+            request_id=_request_id(body),
         )
 
     def _quench(self, params: dict, body: dict) -> dict:
         return self._platform.quench(
-            oven=str(body.get("oven", "oven01")), dt=_as_float(body, "dt", 1.0)
+            oven=str(body.get("oven", "oven01")),
+            dt=_as_float(body, "dt", 1.0),
+            request_id=_request_id(body),
         )
 
     def _reverse(self, params: dict, body: dict) -> dict:
@@ -169,12 +186,38 @@ class Api:
         return self._platform.reverse(
             oven=str(body.get("oven", "oven01")),
             temperature_c=None if temperature is None else float(temperature),
+            request_id=_request_id(body),
         )
 
     def _clean(self, params: dict, body: dict) -> dict:
         return self._platform.clean(
-            oven=str(body.get("oven", "oven01")), dt=_as_float(body, "dt", 1.0)
+            oven=str(body.get("oven", "oven01")),
+            dt=_as_float(body, "dt", 1.0),
+            request_id=_request_id(body),
         )
+
+    def _admission(self, params: dict, body: dict) -> dict:
+        """只判定不执行：控制台据此置灰按钮并展示拒绝原因。"""
+
+        action = str(params.get("action", ""))
+        payload = dict(body)
+        payload.setdefault("oven", str(params.get("oven", "oven01")))
+        return self._platform.admission_preview(action, payload)
+
+    def _requests(self, params: dict, body: dict) -> dict:
+        request_id = params.get("request_id")
+        if request_id:
+            view = self._platform.request_status(str(request_id))
+            return {"request": view}
+        return self._platform.requests_list(limit=int(params.get("limit", 50)))
+
+    def _readback_fault(self, params: dict, body: dict) -> dict:
+        components = body.get("components", [])
+        if not isinstance(components, list):
+            raise CokeError("components 必须是字符串列表", component="console")
+        if components:
+            return self._platform.inject_readback_fault([str(item) for item in components])
+        return self._platform.clear_readback_faults()
 
     def _calibrate(self, params: dict, body: dict) -> dict:
         return self._platform.calibrate_stroke(_as_float(body, "value_mm", self._platform.stroke.baseline_mm))

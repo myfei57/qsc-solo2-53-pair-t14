@@ -42,6 +42,7 @@ def test_platform_error_is_recorded_with_component(platform):
 
 
 def test_events_are_published_to_subscribers(platform):
+    platform.start()
     seen: list[str] = []
     unsubscribe = platform.bus.subscribe("pusher", lambda event: seen.append(event.action))
     platform.push(oven="oven01", guide_target_mm=0.0, guide_measured_mm=0.0, stroke_target_mm=3200.0)
