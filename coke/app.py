@@ -4,12 +4,18 @@
 推焦、熄焦、换向、炉门清扫）、控制循环、并发仲裁探测和状态快照。控制循环
 每个周期做三件事：把集气管压力调向目标带、按推焦联动时序驱动除尘挡板、
 采集趋势；换向与推焦这类跨模块动作都由编排一次性走完并写审计。
+
+动作提交统一走状态门（:mod:`coke.guard`）：每次提交带调用方 ``request_id``
+做并发幂等去重（同一标识只执行一次）；状态判定基于当场读回后冻结的一份
+快照，状态不允许时按动作策略当场拒绝或排队等控制周期放行，拒绝原因、
+控制台展示与审计落盘共用同一份原因与快照口径。
 """
 
 from __future__ import annotations
 
 import dataclasses
 import threading
+from typing import Callable
 
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
@@ -28,6 +34,18 @@ from .gas.collector import CollectorMain
 from .gas.flap import BridgeFlap
 from .gas.latch import FlapLatch
 from .guide.machine import GuideCar
+from .guard import (
+    ACTIONS,
+    POLICIES,
+    Command,
+    CommandRegistry,
+    StateSnapshot,
+    evaluate,
+    is_queueable,
+)
+from .guard.policy import QUEUE, READBACK
+from .guard.registry import COMPLETE, QUEUED, REJECTED, RUNNING
+from .guard.snapshot import IDLE, readback_failure
 from .heating.machine import HeatingReversal
 from .heating.snapshot import HeatingSnapshot
 from .heating.temperature import OvenTemperature
@@ -95,6 +113,11 @@ class Platform:
         self._cycles = 0
         self._operations = 0
         self._lock = threading.RLock()
+        self.commands = CommandRegistry(store)
+        # 当前正在执行的动作占用的碳化室号，供快照做同炉串行判定。
+        self._active_ovens: set[str] = set()
+        # 状态回读故障注入：设备名在集合里时，快照组装按回读失败处理。
+        self._readback_faults: set[str] = set()
         self._register_namespaces()
         self._restore()
 
@@ -138,6 +161,260 @@ class Platform:
             "platform_state",
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
+
+    # ------------------------------------------------------------------ 状态门
+
+    def _state_snapshot(self) -> StateSnapshot:
+        """当场从各设备读回并冻结一份状态快照。
+
+        口径定死为快照：调用方拿到之后，状态判定与审计落盘都只用这一份。
+        任一所需设备回读失败（含故障注入）都属部分失败，按不允许处理。
+        """
+
+        failures: tuple[str, ...] = ()
+
+        def read(device: str, reader: Callable[[], object]) -> object | None:
+            nonlocal failures
+            if device in self._readback_faults:
+                failures = (*failures, device)
+                return None
+            try:
+                return reader()
+            except CokeError:
+                failures = (*failures, device)
+                return None
+
+        fan = read("dust", self.dust.is_running)
+        pusher_state = read("pusher", lambda: self.pusher.state)
+        pusher_ram = read("pusher", lambda: self.pusher.ram_mm)
+        guide_locked = read("guide", self.guide.is_locked)
+        flap_engaged = read("gas", lambda: self.flap.latch.is_engaged())
+        quench_loaded = read("quench", lambda: self.quench_car.snapshot().loaded)
+        quench_oven = read("quench", lambda: self.quench_car.snapshot().oven)
+        reversal_due = read("heating", self.reversal.due)
+        door_open = read("door", self.door.door_open)
+        door_latch = read("door", self.door.latch.is_engaged)
+
+        snapshot = StateSnapshot(
+            fan_running=bool(fan) if fan is not None else False,
+            pusher_state=str(pusher_state) if pusher_state is not None else IDLE,
+            pusher_ram_mm=float(pusher_ram) if pusher_ram is not None else 0.0,
+            guide_locked=bool(guide_locked) if guide_locked is not None else True,
+            flap_engaged=bool(flap_engaged) if flap_engaged is not None else True,
+            quench_loaded=bool(quench_loaded) if quench_loaded is not None else False,
+            quench_oven=str(quench_oven) if quench_oven is not None else "",
+            reversal_due=bool(reversal_due) if reversal_due is not None else False,
+            door_open=bool(door_open) if door_open is not None else False,
+            door_latch_engaged=bool(door_latch) if door_latch is not None else True,
+            active_ovens=tuple(sorted(self._active_ovens)),
+            readback_failures=failures,
+        )
+        if failures:
+            return readback_failure(failures, snapshot)
+        return snapshot
+
+    def inject_readback_fault(self, *devices: str, clear: bool = False) -> dict:
+        """注入/清除状态回读故障（验证 fail-closed 用）。"""
+
+        with self._lock:
+            if clear:
+                self._readback_faults.clear()
+            self._readback_faults.update(devices)
+            return {"faults": sorted(self._readback_faults)}
+
+    def _publish_progress(
+        self,
+        command: Command,
+        *,
+        state: str,
+        severity: str,
+        message: str,
+        snapshot: StateSnapshot,
+        reason: dict | None = None,
+    ) -> None:
+        """命令状态迁移统一从这里进总线，审计口径与响应口径一致。"""
+
+        payload: dict = {
+            "request_id": command.request_id,
+            "action_name": command.action,
+            "oven": command.oven,
+            "state": state,
+            "progress": command.progress,
+            "snapshot_basis": "frozen",
+            "snapshot": snapshot.as_dict(),
+        }
+        if reason:
+            payload["reason_code"] = reason["code"]
+            payload["message"] = message or reason["message"]
+        else:
+            payload["message"] = message
+        self.bus.publish(Event.of("audit", "audit", "command_progress", severity=severity, **payload))
+
+    def submit(self, request_id: str, action: str, oven: str, params: dict) -> dict:
+        """动作提交统一入口：幂等去重 → 快照状态门 → 立即执行或排队。
+
+        同一 ``request_id`` 的并发提交由平台大锁串行化：只有第一个调用执行
+        动作体，其余调用拿到锁时首个提交已落终态或排队，直接回显同一份记录
+        （``duplicate=True``），动作体不会再跑一遍。状态不允许时按动作策略
+        当场拒绝或入队，拒绝原因与所用快照都写审计。
+        """
+
+        if action not in POLICIES:
+            raise CokeError(f"未知动作 {action!r}", component="guard")
+
+        with self._lock:
+            command, acquired, duplicate = self.commands.begin(request_id, action, oven, params)
+            if not acquired:
+                # 平台大锁已把并发提交串行化：第二个同标识请求拿到锁时，首个
+                # 提交必然已落终态或排队。直接回显已有记录，动作体不再执行。
+                return command.envelope(duplicate=True)
+
+            snapshot = self._state_snapshot()
+            command.snapshot = snapshot.as_dict()
+            reason = evaluate(action, snapshot, oven)
+            if reason is None:
+                self.bus.publish(
+                    Event.of(
+                        topic="audit",
+                        component="audit",
+                        action="command_submitted",
+                        severity="notice",
+                        request_id=request_id,
+                        action_name=action,
+                        oven=oven,
+                        state=RUNNING,
+                        snapshot_basis="frozen",
+                        reason_code="",
+                    )
+                )
+                return self._run_command(command, params, snapshot)
+
+            reason_dict = reason.as_dict()
+            if POLICIES[action].mode == QUEUE and is_queueable(reason):
+                self.commands.enqueue(command, reason.code, snapshot.as_dict())
+                self._publish_progress(
+                    command,
+                    state=QUEUED,
+                    severity="notice",
+                    message=f"{action} 排队等待：{reason.message}",
+                    snapshot=snapshot,
+                    reason=reason_dict,
+                )
+                return command.envelope()
+
+            # REJECT 策略：当场拒绝；QUEUE 动作遇到非可排队原因（炉号不符、
+            # 回读失败、同炉忙）也当场拒绝。
+            self.commands.reject(command, reason_dict, snapshot.as_dict())
+            self._publish_progress(
+                command,
+                state=REJECTED,
+                severity="alarm",
+                message=f"{action} 被拒绝：{reason.message}",
+                snapshot=snapshot,
+                reason=reason_dict,
+            )
+            return command.envelope()
+
+    def _run_command(self, command: Command, params: dict, snapshot: StateSnapshot) -> dict:
+        """在平台大锁内实际执行一个已放行命令并落终态。"""
+
+        action = command.action
+        oven = command.oven
+        self._active_ovens.add(oven)
+        command.state = RUNNING
+        command.progress = 0.5
+        runners: dict[str, Callable[[], dict]] = {
+            "charge": lambda: self._execute_charge(oven, params),
+            "push": lambda: self._execute_push(oven, params),
+            "quench": lambda: self._execute_quench(oven, params),
+            "reverse": lambda: self._execute_reverse(oven, params),
+            "clean": lambda: self._execute_clean(oven, params),
+        }
+        try:
+            report = runners[action]()
+        finally:
+            self._active_ovens.discard(oven)
+
+        op_id = str(report.get("op_id", ""))
+        if report.get("ok"):
+            self.commands.finish(command, state=COMPLETE, result=report, op_id=op_id)
+            self._publish_progress(
+                command,
+                state=COMPLETE,
+                severity="notice",
+                message=f"{action} 完成",
+                snapshot=snapshot,
+            )
+        else:
+            # 执行期违约（对位超差等）同样是终态拒绝，原因沿用编排违约项。
+            violations = list(report.get("violations", []))
+            reason = {
+                "code": violations[0] if violations else "execution_incomplete",
+                "message": f"{action} 执行未完成：{', '.join(violations)}",
+                "component": action,
+            }
+            self.commands.finish(command, state=REJECTED, reason=reason, result=report, op_id=op_id)
+            self._publish_progress(
+                command,
+                state=REJECTED,
+                severity="alarm",
+                message=reason["message"],
+                snapshot=snapshot,
+                reason=reason,
+            )
+        return command.envelope()
+
+    def _drain_queue(self) -> list[dict]:
+        """用当场新取的快照按 FIFO 判定排队命令，一次至多放行一个。
+
+        排队命令遇回读失败属"暂时无法判定"，保持排队（fail-closed 但不丢）；
+        只有在状态能读清、且确定遇到不可排队的原因时才当场拒绝。
+        """
+
+        released: list[dict] = []
+        with self._lock:
+            while True:
+                command = self.commands.take_next()
+                if command is None:
+                    break
+                snapshot = self._state_snapshot()
+                command.snapshot = snapshot.as_dict()
+                reason = evaluate(command.action, snapshot, command.oven)
+                if reason is None:
+                    released.append(self._run_command(command, command.params, snapshot))
+                    # 交焦等状态跃迁可能立刻放行下一条（推焦→熄焦联动）。
+                    continue
+                if is_queueable(reason) or reason.code == READBACK:
+                    self.commands.keep_queued(command, reason.code, snapshot.as_dict())
+                else:
+                    reason_dict = reason.as_dict()
+                    self.commands.finish(command, state=REJECTED, reason=reason_dict)
+                    self._publish_progress(
+                        command,
+                        state=REJECTED,
+                        severity="alarm",
+                        message=f"{command.action} 排队后被拒绝：{reason.message}",
+                        snapshot=snapshot,
+                        reason=reason_dict,
+                    )
+                    released.append(command.envelope())
+                break
+        return released
+
+    def command(self, request_id: str) -> dict | None:
+        """查询单条命令的最新状态（控制台轮询用）。"""
+
+        command = self.commands.get(request_id)
+        return None if command is None else command.envelope()
+
+    def commands_describe(self, limit: int = 100) -> dict:
+        """命令登记与排队摘要，供控制台展示。"""
+
+        return {
+            "policies": {action: POLICIES[action].describe() for action in ACTIONS},
+            "pending": self.commands.pending_count(),
+            "commands": self.commands.list_commands(limit=limit),
+        }
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -218,19 +495,39 @@ class Platform:
         hopper_target_mm: float = 0.0,
         hopper_measured_mm: float = 0.0,
         dt: float = 1.0,
+        request_id: str | None = None,
     ) -> dict:
-        """装煤编排：煤斗对位 → 调压 → 开翻板 → 给煤。"""
+        """装煤提交：煤斗对位 → 调压 → 开翻板 → 给煤。"""
 
-        with self._lock:
-            op_id = self.ids.next()
-            report = charge_oven(
-                self.charger, self.collector, self.flap, oven, hopper_target_mm, hopper_measured_mm, dt
-            )
-            summary = self._record_operation(op_id, "charge", report)
-            summary["op_id"] = op_id
-            self._operations += 1
-            self._persist()
-            return {**report, **summary}
+        return self.submit(
+            request_id or self.ids.next(),
+            "charge",
+            oven,
+            {
+                "hopper_target_mm": float(hopper_target_mm),
+                "hopper_measured_mm": float(hopper_measured_mm),
+                "dt": float(dt),
+            },
+        )
+
+    def _execute_charge(self, oven: str, params: dict) -> dict:
+        """装煤编排（状态门已放行）。"""
+
+        op_id = self.ids.next()
+        report = charge_oven(
+            self.charger,
+            self.collector,
+            self.flap,
+            oven,
+            params["hopper_target_mm"],
+            params["hopper_measured_mm"],
+            params["dt"],
+        )
+        summary = self._record_operation(op_id, "charge", report)
+        summary["op_id"] = op_id
+        self._operations += 1
+        self._persist()
+        return {**report, **summary}
 
     def push(
         self,
@@ -240,72 +537,116 @@ class Platform:
         stroke_target_mm: float | None = None,
         speed_mm_s: float | None = None,
         dt: float = 1.0,
+        request_id: str | None = None,
     ) -> dict:
-        """推焦编排：导焦栅对位 → 锁定 → 推焦 → 退杆；同时触发除尘联动。"""
+        """推焦提交：导焦栅对位 → 锁定 → 推焦 → 退杆；同时触发除尘联动。"""
 
-        with self._lock:
-            op_id = self.ids.next()
-            target = self.stroke.baseline_mm if stroke_target_mm is None else stroke_target_mm
-            self.speed.request("auto_cycle", speed_mm_s or self.config.pusher.speed_default_mm_s, priority=50)
-            arbitration = self.speed.resolve()
-            self.schedule.start_link(self.clock.now())
-            report = push_oven(
-                self.pusher,
-                self.guide,
-                oven,
-                guide_target_mm,
-                guide_measured_mm,
-                target,
-                arbitration.speed_mm_s,
-                dt,
-            )
-            stroke_check = self.stroke.check(self.pusher.ram_mm)
-            report["speed_arbitration"] = arbitration.as_dict()
-            report["stroke_check"] = stroke_check
-            summary = self._record_operation(op_id, "push", report)
-            summary["op_id"] = op_id
-            self._operations += 1
-            self._persist()
-            return {**report, **summary}
+        baseline = self.stroke.baseline_mm if stroke_target_mm is None else stroke_target_mm
+        return self.submit(
+            request_id or self.ids.next(),
+            "push",
+            oven,
+            {
+                "guide_target_mm": float(guide_target_mm),
+                "guide_measured_mm": float(guide_measured_mm),
+                "stroke_target_mm": float(baseline),
+                "speed_mm_s": float(
+                    self.config.pusher.speed_default_mm_s if speed_mm_s is None else speed_mm_s
+                ),
+                "dt": float(dt),
+            },
+        )
 
-    def quench(self, oven: str = DEFAULT_OVEN, dt: float = 1.0) -> dict:
-        """熄焦编排：接焦 → 走行 → 喷淋。"""
+    def _execute_push(self, oven: str, params: dict) -> dict:
+        """推焦编排（状态门已放行）；成功后交焦并泵一次等待队列。"""
 
-        with self._lock:
-            op_id = self.ids.next()
-            report = quench_oven(self.quench_car, oven, dt)
-            report["travel_eta_s"] = self.quench_car.plan.eta_s()
-            summary = self._record_operation(op_id, "quench", report)
-            summary["op_id"] = op_id
-            self._operations += 1
-            self._persist()
-            return {**report, **summary}
+        op_id = self.ids.next()
+        self.speed.request("auto_cycle", params["speed_mm_s"], priority=50)
+        arbitration = self.speed.resolve()
+        self.schedule.start_link(self.clock.now())
+        report = push_oven(
+            self.pusher,
+            self.guide,
+            oven,
+            params["guide_target_mm"],
+            params["guide_measured_mm"],
+            params["stroke_target_mm"],
+            arbitration.speed_mm_s,
+            params["dt"],
+        )
+        stroke_check = self.stroke.check(self.pusher.ram_mm)
+        report["speed_arbitration"] = arbitration.as_dict()
+        report["stroke_check"] = stroke_check
+        summary = self._record_operation(op_id, "push", report)
+        summary["op_id"] = op_id
+        self._operations += 1
+        self._persist()
+        result = {**report, **summary}
+        if report.get("ok"):
+            # 推焦完成即交焦：熄焦车进入"已接焦"，排队的熄焦命令可立即放行。
+            self.quench_car.receive(oven)
+            self._drain_queue()
+        return result
 
-    def reverse(self, oven: str = DEFAULT_OVEN, temperature_c: float | None = None) -> dict:
-        """换向编排：废气阀 → 煤气阀 → 炉温确认。"""
+    def quench(self, oven: str = DEFAULT_OVEN, dt: float = 1.0, request_id: str | None = None) -> dict:
+        """熄焦提交：走行 → 喷淋（未接焦时按策略排队等推焦交焦）。"""
 
-        with self._lock:
-            op_id = self.ids.next()
-            target_temp = self.config.heating.temp_target_c if temperature_c is None else temperature_c
-            report = reverse_heating(self.reversal, self.valves, self.temperature, oven, target_temp)
-            report["offset_c"] = self.temperature.offset_c()
-            summary = self._record_operation(op_id, "reverse", report)
-            summary["op_id"] = op_id
-            self._operations += 1
-            self._persist()
-            return {**report, **summary}
+        return self.submit(request_id or self.ids.next(), "quench", oven, {"dt": float(dt)})
 
-    def clean(self, oven: str = DEFAULT_OVEN, dt: float = 1.0) -> dict:
-        """炉门清扫编排：松开闩锁 → 开炉门 → 清扫 → 复位闩锁。"""
+    def _execute_quench(self, oven: str, params: dict) -> dict:
+        """熄焦编排（状态门已放行）。"""
 
-        with self._lock:
-            op_id = self.ids.next()
-            report = clean_door(self.door, oven, dt)
-            summary = self._record_operation(op_id, "clean", report)
-            summary["op_id"] = op_id
-            self._operations += 1
-            self._persist()
-            return {**report, **summary}
+        op_id = self.ids.next()
+        report = quench_oven(self.quench_car, oven, params["dt"])
+        report["travel_eta_s"] = self.quench_car.plan.eta_s()
+        summary = self._record_operation(op_id, "quench", report)
+        summary["op_id"] = op_id
+        self._operations += 1
+        self._persist()
+        return {**report, **summary}
+
+    def reverse(
+        self,
+        oven: str = DEFAULT_OVEN,
+        temperature_c: float | None = None,
+        request_id: str | None = None,
+    ) -> dict:
+        """换向提交：废气阀 → 煤气阀 → 炉温确认（未到期按策略排队）。"""
+
+        target = self.config.heating.temp_target_c if temperature_c is None else temperature_c
+        return self.submit(
+            request_id or self.ids.next(), "reverse", oven, {"temperature_c": float(target)}
+        )
+
+    def _execute_reverse(self, oven: str, params: dict) -> dict:
+        """换向编排（状态门已放行）。"""
+
+        op_id = self.ids.next()
+        report = reverse_heating(
+            self.reversal, self.valves, self.temperature, oven, params["temperature_c"]
+        )
+        report["offset_c"] = self.temperature.offset_c()
+        summary = self._record_operation(op_id, "reverse", report)
+        summary["op_id"] = op_id
+        self._operations += 1
+        self._persist()
+        return {**report, **summary}
+
+    def clean(self, oven: str = DEFAULT_OVEN, dt: float = 1.0, request_id: str | None = None) -> dict:
+        """炉门清扫提交：松开闩锁 → 开炉门 → 清扫 → 复位闩锁。"""
+
+        return self.submit(request_id or self.ids.next(), "clean", oven, {"dt": float(dt)})
+
+    def _execute_clean(self, oven: str, params: dict) -> dict:
+        """炉门清扫编排（状态门已放行）。"""
+
+        op_id = self.ids.next()
+        report = clean_door(self.door, oven, params["dt"])
+        summary = self._record_operation(op_id, "clean", report)
+        summary["op_id"] = op_id
+        self._operations += 1
+        self._persist()
+        return {**report, **summary}
 
     def cycle(self, dt: float = 1.0) -> dict:
         """推进一个控制周期，返回本周期摘要。"""
@@ -325,6 +666,8 @@ class Platform:
             self.trend.append("collector_pressure", moment, pressure)
             self.trend.append("damper_angle", moment, angle)
             self._persist()
+            # 每周期用当场新取的快照判定排队命令（换向到期、熄焦接焦等）。
+            released = self._drain_queue()
             return {
                 "cycle": self._cycles,
                 "pressure_pa": round(pressure, 2),
@@ -333,6 +676,7 @@ class Platform:
                 "damper_deg": round(angle, 2),
                 "linkage_due": linkage,
                 "linkage_elapsed_s": round(self.schedule.elapsed_s(moment), 2),
+                "released": [item["request_id"] for item in released],
             }
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
@@ -485,6 +829,10 @@ class Platform:
             "heating": self.heating_snapshot().as_dict(),
             "dust": self.dust_snapshot().as_dict(),
             "dust_starts": self.dust.starts(),
+            "commands_pending": self.commands.pending_count(),
+            "policies": {
+                action: {"mode": POLICIES[action].mode} for action in ACTIONS
+            },
             "audit": self.audit.summary(),
             "ids_issued": self.ids.issued(),
         }

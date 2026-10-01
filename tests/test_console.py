@@ -13,6 +13,7 @@ def test_api_returns_status_and_routes(platform):
     assert payload["platform"] == platform.config.name
     routes = api.routes()
     assert any(route["path"] == "/api/push" for route in routes)
+    assert any(route["path"] == "/api/commands" for route in routes)
 
 
 def test_api_unknown_path_is_404(platform):
@@ -22,22 +23,74 @@ def test_api_unknown_path_is_404(platform):
     assert payload["error"] == "not_found"
 
 
-def test_api_interlock_error_is_409(platform):
+def test_api_action_requires_request_id(platform):
     api = Api(platform)
+    platform.start()
     status, payload = api.handle(
         "POST", "/api/push", {}, {"guide_target_mm": 0.0, "guide_measured_mm": 90.0}
     )
+    assert status == 409
+    assert payload["component"] == "console"
+
+
+def test_api_rejected_action_returns_reason(platform):
+    api = Api(platform)
+    # 未启动除尘风机：charge 策略当场拒绝，200 + 结构化原因。
+    status, payload = api.handle(
+        "POST",
+        "/api/charge",
+        {},
+        {"oven": "oven01", "hopper_target_mm": 0.0, "hopper_measured_mm": 0.0, "request_id": "r-fan"},
+    )
     assert status == 200
-    assert payload["ok"] is False
+    assert payload["state"] == "rejected"
+    assert payload["reason"]["code"] == "fan_not_running"
+
+    platform.start()
     status_error, error_payload = api.handle("POST", "/api/calibrate", {}, {"value_mm": -1})
     assert status_error == 409
     assert error_payload["component"] == "pusher"
 
 
+def test_api_duplicate_request_id_is_idempotent(platform):
+    api = Api(platform)
+    platform.start()
+    body = {
+        "oven": "oven01",
+        "hopper_target_mm": 0.0,
+        "hopper_measured_mm": 0.0,
+        "request_id": "r-dup",
+    }
+    status, first = api.handle("POST", "/api/charge", {}, dict(body))
+    assert status == 200 and first["state"] == "complete"
+    status, second = api.handle("POST", "/api/charge", {}, dict(body))
+    assert status == 200
+    assert second["duplicate"] is True
+    assert second["op_id"] == first["op_id"]
+
+
+def test_api_command_lookup_and_policies(platform):
+    api = Api(platform)
+    platform.start()
+    api.handle(
+        "POST",
+        "/api/charge",
+        {},
+        {"oven": "oven01", "hopper_target_mm": 0.0, "hopper_measured_mm": 0.0, "request_id": "r-look"},
+    )
+    status, payload = api.handle("GET", "/api/commands", {}, {})
+    assert status == 200
+    assert payload["policies"]["quench"]["mode"] == "queue"
+    assert payload["policies"]["push"]["mode"] == "reject"
+    status, one = api.handle("GET", "/api/commands/r-look", {}, {})
+    assert status == 200 and one["found"] is True
+    assert one["command"]["state"] == "complete"
+
+
 def test_api_timeline_and_journal(platform):
     api = Api(platform)
     platform.start()
-    platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0)
+    platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0, request_id="r-tl")
     status, timeline = api.handle("GET", "/api/timeline", {"oven": "oven01"}, {})
     assert status == 200
     assert timeline["timeline"][0]["step"] == 1
@@ -49,7 +102,7 @@ def test_api_timeline_and_journal(platform):
 def test_readiness_and_step_endpoints(platform):
     api = Api(platform)
     platform.start()
-    platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0)
+    platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0, request_id="r-rdy")
     platform.cycle(dt=1.0)
     status, ready = api.handle("GET", "/api/readiness", {}, {})
     assert status == 200

@@ -45,3 +45,11 @@ class ConfigError(CokeError):
 
 class NamespaceError(CokeError):
     """命名空间重复注册或解析失败。"""
+
+
+class IdempotencyConflictError(CokeError):
+    """同一提交标识被用于参数不同的两次提交。"""
+
+    def __init__(self, request_id: str) -> None:
+        super().__init__(f"request_id={request_id} 已用于参数不同的提交", component="guard")
+        self.request_id = request_id

@@ -69,14 +69,20 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     platform.reset_state()
 
     startup = platform.start()
-    charge = platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0)
+    # 动作都带显式 request_id，演示"控制台连点只执行一次"的幂等口径。
+    charge = platform.charge(
+        oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0, request_id="demo-charge"
+    )
     disturbance = platform.disturb_collector(delta_pa=-45.0)
     clock.advance(config.heating.reversal_interval_s)
-    reversal = platform.reverse(oven="oven01", temperature_c=config.heating.temp_target_c)
-    push = platform.push(oven="oven01", guide_target_mm=0.0, guide_measured_mm=0.0)
-    quench = platform.quench(oven="oven01")
+    reversal = platform.reverse(
+        oven="oven01", temperature_c=config.heating.temp_target_c, request_id="demo-reverse"
+    )
+    push = platform.push(oven="oven01", guide_target_mm=0.0, guide_measured_mm=0.0, request_id="demo-push")
+    # 熄焦在未接焦时会排队；推焦完成交焦后由控制周期放行。
+    quench = platform.quench(oven="oven01", request_id="demo-quench")
     cycles = [platform.cycle(dt=1.0) for _ in range(8)]
-    cleaning = platform.clean(oven="oven01")
+    cleaning = platform.clean(oven="oven01", request_id="demo-clean")
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     calibration = platform.calibrate_stroke(value_mm=3212.0)
     shutdown = platform.stop()
@@ -87,16 +93,25 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     probe = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
     server.stop()
 
+    def summarize(envelope: dict) -> dict:
+        result = envelope.get("result") or {}
+        return {
+            "state": envelope["state"],
+            "ok": envelope["ok"],
+            "reason": envelope.get("reason"),
+            "steps": [step["action"] for step in result.get("steps", [])],
+        }
+
     report = {
         "startup": startup,
-        "charge": {"ok": charge["ok"], "steps": [step["action"] for step in charge["steps"]]},
+        "charge": summarize(charge),
         "disturbance": disturbance,
-        "reversal": {"ok": reversal["ok"], "steps": [step["action"] for step in reversal["steps"]]},
-        "push": {"ok": push["ok"], "steps": [step["action"] for step in push["steps"]]},
-        "quench": {"ok": quench["ok"], "steps": [step["action"] for step in quench["steps"]]},
+        "reversal": summarize(reversal),
+        "push": summarize(push),
+        "quench": summarize(quench),
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
-        "cleaning": {"ok": cleaning["ok"], "steps": [step["action"] for step in cleaning["steps"]]},
+        "cleaning": summarize(cleaning),
         "concurrency": concurrency,
         "calibration": calibration,
         "shutdown": shutdown,
@@ -105,9 +120,16 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     }
     _dump(report)
     failures = [name for name, item in probe.items() if not item["ok"]]
-    for operation in (charge, reversal, push, quench, cleaning):
-        if not operation["ok"]:
-            failures.extend(operation["violations"])
+    for name, envelope in (
+        ("charge", charge),
+        ("reversal", reversal),
+        ("push", push),
+        ("quench", quench),
+        ("cleaning", cleaning),
+    ):
+        if not envelope["ok"]:
+            reason = envelope.get("reason") or {}
+            failures.append(f"{name}:{reason.get('code', 'incomplete')}")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1

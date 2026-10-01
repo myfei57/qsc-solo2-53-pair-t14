@@ -1,4 +1,8 @@
-"""熄焦顺序：接焦 → 走行 → 喷淋。"""
+"""熄焦顺序：走行 → 喷淋。
+
+接焦不在这里做：红焦由推焦完成时由平台交给熄焦车（``QuenchCar.receive``），
+状态门据此放行/排队熄焦提交，避免编排自行复位把"未接焦"这道联锁架空。
+"""
 
 from __future__ import annotations
 
@@ -13,7 +17,11 @@ def quench_oven(quench: QuenchCar, oven: str, dt: float = 1.0) -> dict:
     steps: list[dict] = []
     violations: list[str] = []
 
-    quench.receive(oven)
+    if not quench.snapshot().loaded:
+        # 状态门已按 quench_not_loaded 排队；这里兜底防止绕过编排直调。
+        violations.append("quench_not_loaded")
+        return {"oven": oven, "ok": False, "steps": steps, "violations": violations}
+
     steps.append({"component": "quench", "action": "receive", "detail": {"oven": oven}})
 
     for _ in range(MAX_STEPS):

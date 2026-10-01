@@ -1,7 +1,10 @@
 """控制台接口处理器。
 
-每个接口都是对平台公开方法的一次调用；动作类接口把请求体里的参数透传给平台，
-缺少必填字段时返回 ``400``，平台异常统一转成 ``409`` 并在响应里带上组件名。
+每个接口都是对平台公开方法的一次调用；动作类接口把请求体里的参数连同
+``request_id`` 一起交给平台状态门（同一标识幂等、只执行一次），缺少必填
+字段时返回 ``400``，平台异常统一转成 ``409`` 并在响应里带上组件名。
+状态不允许导致的当场拒绝不是异常：动作接口返回 ``200`` 且响应体
+``state=rejected`` 并带结构化 ``reason``，供控制台直接展示并已落审计。
 """
 
 from __future__ import annotations
@@ -18,6 +21,13 @@ def _as_float(body: dict, key: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError) as error:
         raise CokeError(f"参数 {key!r} 必须是数值", component="console") from error
+
+
+def _request_id(body: dict) -> str:
+    value = body.get("request_id")
+    if value is None or not str(value).strip():
+        raise CokeError("缺少 request_id：每次动作提交必须带幂等标识", component="console")
+    return str(value).strip()
 
 
 class Api:
@@ -46,6 +56,8 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/commands", self._commands)
+        add("GET", "/api/commands/{request_id}", self._command)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
         add("POST", "/api/push", self._push)
@@ -55,6 +67,7 @@ class Api:
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/concurrency", self._concurrency)
+        add("POST", "/api/fault/readback", self._readback_fault)
         add("POST", "/api/reset", lambda params, body: {"removed": self._platform.reset_state()})
 
     def routes(self) -> list[dict]:
@@ -138,6 +151,23 @@ class Api:
         }
         return {"ready": all(checks.values()), "checks": checks, "info": info}
 
+    def _commands(self, params: dict, body: dict) -> dict:
+        return self._platform.commands_describe(limit=int(params.get("limit", 100)))
+
+    def _command(self, params: dict, body: dict) -> dict:
+        command = self._platform.command(str(params["request_id"]))
+        if command is None:
+            return {"found": False, "request_id": params["request_id"]}
+        return {"found": True, "command": command}
+
+    def _readback_fault(self, params: dict, body: dict) -> dict:
+        devices = body.get("devices", ())
+        if isinstance(devices, str):
+            devices = (devices,)
+        return self._platform.inject_readback_fault(
+            *[str(item) for item in devices], clear=bool(body.get("clear", False))
+        )
+
     def _step(self, params: dict, body: dict) -> dict:
         return self._platform.cycle(dt=_as_float(body, "dt", 1.0))
 
@@ -147,6 +177,7 @@ class Api:
             hopper_target_mm=_as_float(body, "hopper_target_mm", 0.0),
             hopper_measured_mm=_as_float(body, "hopper_measured_mm", 0.0),
             dt=_as_float(body, "dt", 1.0),
+            request_id=_request_id(body),
         )
 
     def _push(self, params: dict, body: dict) -> dict:
@@ -157,11 +188,14 @@ class Api:
             stroke_target_mm=_as_float(body, "stroke_target_mm", self._platform.stroke.baseline_mm),
             speed_mm_s=_as_float(body, "speed_mm_s", self._platform.config.pusher.speed_default_mm_s),
             dt=_as_float(body, "dt", 1.0),
+            request_id=_request_id(body),
         )
 
     def _quench(self, params: dict, body: dict) -> dict:
         return self._platform.quench(
-            oven=str(body.get("oven", "oven01")), dt=_as_float(body, "dt", 1.0)
+            oven=str(body.get("oven", "oven01")),
+            dt=_as_float(body, "dt", 1.0),
+            request_id=_request_id(body),
         )
 
     def _reverse(self, params: dict, body: dict) -> dict:
@@ -169,11 +203,14 @@ class Api:
         return self._platform.reverse(
             oven=str(body.get("oven", "oven01")),
             temperature_c=None if temperature is None else float(temperature),
+            request_id=_request_id(body),
         )
 
     def _clean(self, params: dict, body: dict) -> dict:
         return self._platform.clean(
-            oven=str(body.get("oven", "oven01")), dt=_as_float(body, "dt", 1.0)
+            oven=str(body.get("oven", "oven01")),
+            dt=_as_float(body, "dt", 1.0),
+            request_id=_request_id(body),
         )
 
     def _calibrate(self, params: dict, body: dict) -> dict:

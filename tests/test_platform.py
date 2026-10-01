@@ -43,7 +43,7 @@ def test_calibrate_stroke_updates_baseline(platform):
 
 def test_status_and_snapshot_expose_components(platform):
     platform.start()
-    platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0)
+    platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0, request_id="r-status")
     status = platform.status()
     for key in ("pusher", "guide", "charger", "quench", "gas", "door", "heating", "dust", "audit"):
         assert key in status
@@ -56,7 +56,7 @@ def test_operations_and_cycles_persist_across_restart(tmp_path, clock):
     storage = str(tmp_path / "state")
     first = build_platform(default_config(), clock=clock, storage_root=storage)
     first.start()
-    first.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0)
+    first.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0, request_id="r-restore-1")
     first.cycle(dt=1.0)
     assert first.status()["operations"] == 1
 
@@ -64,6 +64,12 @@ def test_operations_and_cycles_persist_across_restart(tmp_path, clock):
     status = second.status()
     assert status["operations"] >= 1
     assert status["cycles"] >= 1
+    # 幂等窗口跨重启仍然成立：同标识重发不产生第二次操作。
+    replay = second.charge(
+        oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0, request_id="r-restore-1"
+    )
+    assert replay["duplicate"] is True
+    assert second.status()["operations"] == status["operations"]
 
 
 def test_heating_state_restores_from_journal(tmp_path, clock):
@@ -72,7 +78,7 @@ def test_heating_state_restores_from_journal(tmp_path, clock):
     first = build_platform(config, clock=clock, storage_root=storage)
     first.start()
     clock.advance(config.heating.reversal_interval_s)
-    assert first.reverse(oven="oven01")["ok"] is True
+    assert first.reverse(oven="oven01", request_id="r-rev-restore")["ok"] is True
 
     second = build_platform(config, clock=clock, storage_root=storage)
     assert second.reversal.count() >= 1

@@ -13,7 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def test_operations_are_captured_in_audit(platform):
     platform.start()
-    platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0)
+    platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0, request_id="r-audit-1")
     entries = platform.audit.entries(limit=10)
     assert entries
     assert any(item["action"] == "charge_complete" for item in entries)
@@ -24,11 +24,15 @@ def test_operations_are_captured_in_audit(platform):
 
 def test_interlock_rejection_is_recorded_as_alarm(platform):
     platform.start()
-    rejected = platform.push(oven="oven01", guide_target_mm=0.0, guide_measured_mm=80.0)
-    assert rejected["ok"] is False
-    assert "guide_not_aligned" in rejected["violations"]
+    rejected = platform.push(
+        oven="oven01", guide_target_mm=0.0, guide_measured_mm=80.0, request_id="r-audit-rej"
+    )
+    # 状态门放行后在对位环节失败，终态 rejected，原因码沿用编排违约项。
+    assert rejected["state"] == "rejected"
+    assert rejected["reason"]["code"] == "guide_not_aligned"
     alarms = platform.audit.alarms()
     assert any(item["action"] == "interlock_rejected" for item in alarms)
+    assert any(item["action"] == "command_progress" for item in alarms)
 
 
 def test_platform_error_is_recorded_with_component(platform):
@@ -42,9 +46,16 @@ def test_platform_error_is_recorded_with_component(platform):
 
 
 def test_events_are_published_to_subscribers(platform):
+    platform.start()
     seen: list[str] = []
     unsubscribe = platform.bus.subscribe("pusher", lambda event: seen.append(event.action))
-    platform.push(oven="oven01", guide_target_mm=0.0, guide_measured_mm=0.0, stroke_target_mm=3200.0)
+    platform.push(
+        oven="oven01",
+        guide_target_mm=0.0,
+        guide_measured_mm=0.0,
+        stroke_target_mm=3200.0,
+        request_id="r-audit-events",
+    )
     assert "extend" in seen and "retract" in seen
     unsubscribe()
     assert platform.bus.history("pusher")
